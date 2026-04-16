@@ -1,0 +1,299 @@
+esphome:
+  name: caravan-controller-final
+  friendly_name: "Caravan Switch Panel"
+
+  # FIX: Disable brownout detection
+  on_boot:
+    priority: 800
+    then:
+      - lambda: |-
+          #include "soc/soc.h"
+          #include "soc/rtc_cntl_reg.h"
+          WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+api:
+  # essential for the homeassistant.service call to work
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: "Nan and Pop_IoT"
+  password: "archie1954"
+
+  ap:
+    ssid: "Caravan-Fallback"
+    password: "password123"
+
+  # Status LED Logic: Green when connected
+  on_connect:
+    - delay: 2s
+    - light.turn_on:
+        id: status_led
+        effect: "None"
+        brightness: 50%
+        red: 0%
+        green: 100%
+        blue: 0%
+        white: 0%
+
+  # Status LED Logic: Blink Red when disconnected
+  on_disconnect:
+    - light.turn_on:
+        id: status_led
+        effect: "WiFi Connecting"
+
+# ---------------------------------------------------------
+# GLOBALS (To track dimming direction)
+# ---------------------------------------------------------
+globals:
+  - id: dir_light_1
+    type: bool
+    initial_value: 'true' # true = UP (Brighten), false = DOWN (Dim)
+  - id: dir_light_2
+    type: bool
+    initial_value: 'true'
+
+# ---------------------------------------------------------
+# SENSORS
+# ---------------------------------------------------------
+sensor:
+  - platform: adc
+    pin: GPIO34
+    id: batt_voltage
+    name: "Caravan Battery Voltage"
+    update_interval: 10s
+    attenuation: 11db
+    filters:
+      - multiply: 11.0
+
+# ---------------------------------------------------------
+# OUTPUTS
+# ---------------------------------------------------------
+output:
+  # MOSFETS for Lights
+  - platform: ledc
+    pin: GPIO25
+    id: mosfet_output_1
+    frequency: 1000Hz
+    min_power: 0%
+
+  - platform: ledc
+    pin: GPIO26
+    id: mosfet_output_2
+    frequency: 1000Hz
+    min_power: 0%
+
+  # Button LEDs
+  - platform: gpio
+    pin: GPIO32
+    id: btn_led_1
+    inverted: false
+
+  - platform: gpio
+    pin: GPIO33
+    id: btn_led_2
+    inverted: false
+
+# ---------------------------------------------------------
+# LIGHTS
+# ---------------------------------------------------------
+light:
+  # 1. Status LED
+  - platform: esp32_rmt_led_strip
+    chipset: sk6812
+    rgb_order: GRB
+    pin: GPIO18
+    num_leds: 1
+    name: "Board Status LED"
+    id: status_led
+    restore_mode: ALWAYS_OFF 
+    effects:
+      - strobe:
+          name: "WiFi Connecting"
+          colors:
+            - state: true
+              brightness: 30%
+              red: 100%
+              green: 0%
+              blue: 0%
+              duration: 500ms
+            - state: false
+              duration: 500ms
+
+  # 2. Main Light 1
+  - platform: monochromatic
+    output: mosfet_output_1
+    name: "Dining Light"
+    id: light_1
+    default_transition_length: 0.5s
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_state:
+      - if:
+          condition:
+            light.is_on: light_1
+          then:
+            - output.turn_on: btn_led_1
+          else:
+            - output.turn_off: btn_led_1
+
+  # 3. Main Light 2
+  - platform: monochromatic
+    output: mosfet_output_2
+    name: "Kitchen Light"
+    id: light_2
+    default_transition_length: 0.5s
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_state:
+      - if:
+          condition:
+            light.is_on: light_2
+          then:
+            - output.turn_on: btn_led_2
+          else:
+            - output.turn_off: btn_led_2
+
+# ---------------------------------------------------------
+# SCRIPTS
+# ---------------------------------------------------------
+script:
+  - id: check_battery_health
+    then:
+      - if:
+          condition:
+            lambda: 'return id(batt_voltage).state >= 12.6;'
+          then:
+            - light.turn_on: { id: status_led, brightness: 50%, red: 0%, green: 100%, blue: 0% }
+      - if:
+          condition:
+            lambda: 'return (id(batt_voltage).state < 12.6) && (id(batt_voltage).state >= 12.0);'
+          then:
+            - light.turn_on: { id: status_led, brightness: 50%, red: 100%, green: 50%, blue: 0% }
+      - if:
+          condition:
+            lambda: 'return id(batt_voltage).state < 12.0;'
+          then:
+            - light.turn_on: { id: status_led, brightness: 50%, red: 100%, green: 0%, blue: 0% }
+      - delay: 5s
+      # Return to Normal (Green 50%)
+      - light.turn_on: { id: status_led, brightness: 50%, red: 0%, green: 100%, blue: 0% }
+
+# ---------------------------------------------------------
+# BUTTONS (Fixed Timing)
+# ---------------------------------------------------------
+binary_sensor:
+  # BUTTON 1 (Dining) - UPDATED FOR RADIO
+  - platform: gpio
+    pin:
+      number: GPIO21
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Button 1 Input"
+    id: button_1
+    on_multi_click:
+      # 1. SINGLE CLICK: Toggle Light 1
+      - timing:
+          - ON for at most 0.8s
+          - OFF for at least 0.2s
+        then:
+          - light.toggle: light_1
+
+      # 2. DOUBLE CLICK: Start Morning Radio smooth relax
+      - timing:
+          - ON for at most 0.8s
+          - OFF for at most 0.5s
+          - ON for at most 0.8s
+          - OFF for at least 0.2s
+        then:
+          - homeassistant.service:
+              service: script.start_morning_radio
+
+      # 3. HOLD: Dimming Logic
+      # Must hold for > 0.8s
+      - timing:
+          - ON for at least 0.8s
+        then:
+          - while:
+              condition:
+                binary_sensor.is_on: button_1
+              then:
+                - if:
+                    condition:
+                      lambda: 'return id(dir_light_1);'
+                    then:
+                      - light.dim_relative: { id: light_1, relative_brightness: 5%, transition_length: 0.05s }
+                    else:
+                      # Dim Down (Stop at 10%)
+                      - if:
+                          condition:
+                            lambda: 'return id(light_1).remote_values.get_brightness() > 0.1;'
+                          then:
+                            - light.dim_relative: { id: light_1, relative_brightness: -5%, transition_length: 0.05s }
+                - delay: 0.1s
+          - lambda: 'id(dir_light_1) = !id(dir_light_1);'
+
+  # BUTTON 2 (Kitchen)
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Button 2 Input"
+    id: button_2
+    on_multi_click:
+      # 1. SINGLE CLICK: Toggle Light 2
+      - timing:
+          - ON for at most 0.8s
+          - OFF for at least 0.2s
+        then:
+          - light.toggle: light_2
+
+      # 2. DOUBLE CLICK: Night Light Mode
+      - timing:
+          - ON for at most 0.8s
+          - OFF for at most 0.5s
+          - ON for at most 0.8s
+          - OFF for at least 0.2s
+        then:
+          - light.turn_off: light_1
+          - light.turn_off: light_2
+          - light.turn_on: { id: status_led, brightness: 80%, red: 0%, green: 0%, blue: 0%, white: 100% }
+
+      # 3. TRIPLE CLICK: Check Battery Health
+      - timing:
+          - ON for at most 0.8s
+          - OFF for at most 0.5s
+          - ON for at most 0.8s
+          - OFF for at most 0.5s
+          - ON for at most 0.8s
+          - OFF for at least 0.2s
+        then:
+          - script.execute: check_battery_health
+
+      # 4. HOLD: Dimming Logic
+      - timing:
+          - ON for at least 0.8s
+        then:
+          - while:
+              condition:
+                binary_sensor.is_on: button_2
+              then:
+                - if:
+                    condition:
+                      lambda: 'return id(dir_light_2);'
+                    then:
+                      - light.dim_relative: { id: light_2, relative_brightness: 5%, transition_length: 0.05s }
+                    else:
+                      - if:
+                          condition:
+                            lambda: 'return id(light_2).remote_values.get_brightness() > 0.1;'
+                          then:
+                            - light.dim_relative: { id: light_2, relative_brightness: -5%, transition_length: 0.05s }
+                - delay: 0.1s
+          - lambda: 'id(dir_light_2) = !id(dir_light_2);'
