@@ -24,8 +24,8 @@ ota:
   - platform: esphome
 
 wifi:
-  ssid: "Nan and Pop_IoT"
-  password: "archie1954"
+  ssid: secret
+  password: secret
 
   ap:
     ssid: "Caravan-Fallback"
